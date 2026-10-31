@@ -1,0 +1,146 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 3b9df7e..92591b6 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -9,5 +9,6 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+ # "Trim" the build. Include the minimal set of components, main, and anything it depends on.
+ idf_build_set_property(MINIMAL_BUILD ON)
+ 
+-set(PROJECT_VER "2.5.3")
++set(PROJECT_VER "9.9.9")  # 二开版：高版本号避免官方 OTA 覆盖
++
+ project(xiaozhi)
+diff --git a/main/CMakeLists.txt b/main/CMakeLists.txt
+index 8c318f1..4ea01e9 100644
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -1007,6 +1007,11 @@ if(CONFIG_IDF_TARGET_ESP32S3 OR CONFIG_IDF_TARGET_ESP32P4 OR CONFIG_IDF_TARGET_E
+     list(APPEND SOURCES "audio/engines/afe_audio_engine.cc")
+     list(APPEND SOURCES "audio/wake_words/custom_wake_word.cc")
+     list(APPEND SOURCES "audio/wake_words/wake_word_audio_cache.cc")
++    if(CONFIG_SOUND_EVENT_TISSUE)
++        list(APPEND SOURCES "audio/sound_events/tissue_sound_detector.cc")
++        list(APPEND SOURCES "audio/sound_events/tissue_model_data.cc")
++        list(APPEND SOURCES "audio/sound_events/tissue_mel_filterbank.cc")
++    endif()
+ else()
+     list(APPEND SOURCES "audio/engines/lite_audio_engine.cc")
+     list(APPEND SOURCES "audio/wake_words/esp_wake_word.cc")
+diff --git a/main/Kconfig.projbuild b/main/Kconfig.projbuild
+index 3917618..d01fb00 100644
+--- a/main/Kconfig.projbuild
++++ b/main/Kconfig.projbuild
+@@ -1048,6 +1048,22 @@ config WAKE_WORD_DETECTION_IN_LISTENING
+         which allows interrupting the current conversation.
+         When disabled (default), wake word detection is turned off during listening.
+ 
++menu "Sound Event Wake"
++    config SOUND_EVENT_TISSUE
++        bool "Enable tissue-pull sound wake"
++        default n
++        depends on USE_AFE_WAKE_WORD
++        help
++            Bypass sound-event detector: continuous tissue-pull sound
++            (a few sheets pulled in a row) triggers the same wake flow
++            as the voice wake word. Official pipeline untouched.
++
++    config SOUND_EVENT_TISSUE_NAME
++        string "Wake name reported to server"
++        default "抽纸"
++        depends on SOUND_EVENT_TISSUE
++endmenu
++
+ config USE_AUDIO_PROCESSOR
+     bool "Enable AFE Audio Processing"
+     default y
+diff --git a/main/application.cc b/main/application.cc
+index e1f0719..f635036 100644
+--- a/main/application.cc
++++ b/main/application.cc
+@@ -11,6 +11,9 @@
+ #include "system_info.h"
+ #include "text_glyph_payload.h"
+ #include "websocket_protocol.h"
++#if CONFIG_SOUND_EVENT_TISSUE
++#include "audio/sound_events/tissue_sound_detector.h"
++#endif
+ 
+ #include <driver/gpio.h>
+ #include <esp_log.h>
+@@ -98,6 +101,10 @@ void Application::Initialize() {
+     };
+     audio_service_.SetCallbacks(callbacks);
+ 
++#if CONFIG_SOUND_EVENT_TISSUE
++    GetTissueSoundDetector().Initialize();
++#endif
++
+     // Add state change listeners
+     state_machine_.AddStateChangeListener([this](DeviceState old_state, DeviceState new_state) {
+         xEventGroupSetBits(event_group_, MAIN_EVENT_STATE_CHANGED);
+@@ -286,6 +293,13 @@ void Application::Run() {
+             auto display = Board::GetInstance().GetDisplay();
+             display->UpdateStatusBar();
+ 
++#if CONFIG_SOUND_EVENT_TISSUE
++            // 抽纸声触发：与语音唤醒词走同一 WakeWordInvoke 入口
++            if (GetTissueSoundDetector().MaybeTrigger()) {
++                WakeWordInvoke(CONFIG_SOUND_EVENT_TISSUE_NAME);
++            }
++#endif
++
+             // Print debug info every 10 seconds
+             if (clock_ticks_ % 10 == 0) {
+                 SystemInfo::PrintHeapStats();
+@@ -1029,6 +1043,12 @@ void Application::HandleStateChangedEvent() {
+     auto led = board.GetLed();
+     led->OnStateChanged();
+ 
++#if CONFIG_SOUND_EVENT_TISSUE
++    // 抽纸检测只在待机态监听：非 idle 关闭并清空历史，
++    // 避免听到自己的 TTS/对话声或对话中途误触发
++    GetTissueSoundDetector().Enable(new_state == kDeviceStateIdle);
++#endif
++
+     switch (new_state) {
+         case kDeviceStateUnknown:
+         case kDeviceStateIdle:
+diff --git a/main/audio/engines/afe_audio_engine.cc b/main/audio/engines/afe_audio_engine.cc
+index e245876..6d0b186 100644
+--- a/main/audio/engines/afe_audio_engine.cc
++++ b/main/audio/engines/afe_audio_engine.cc
+@@ -12,6 +12,9 @@
+ 
+ #include "audio_service.h"
+ #include "wake_words/custom_wake_word.h"
++#if CONFIG_SOUND_EVENT_TISSUE
++#include "sound_events/tissue_sound_detector.h"
++#endif
+ 
+ #define TAG "AfeAudioEngine"
+ 
+@@ -445,6 +448,12 @@ void AfeAudioEngine::ProcessingTask() {
+         if (bits & kWakeWordEnabled) {
+             HandleWakeWordResult(result);
+         }
++#if CONFIG_SOUND_EVENT_TISSUE
++        // 抽纸检测旁路：只读拷贝 AFE 输出，不影响唤醒词判定；
++        // 只在待机态生效（Enable(false) 时 Feed 内部直接丢弃）
++        GetTissueSoundDetector().Feed(reinterpret_cast<const int16_t*>(result->data),
++                                      result->data_size / sizeof(int16_t));
++#endif
+         if (kUseAfeForVoiceProcessing && (bits & kVoiceProcessingEnabled)) {
+             HandleVoiceResult(result);
+         }
+diff --git a/main/idf_component.yml b/main/idf_component.yml
+index c9c64ec..9b2c2e3 100644
+--- a/main/idf_component.yml
++++ b/main/idf_component.yml
+@@ -41,6 +41,7 @@ dependencies:
+   espressif/led_strip: ~3.0.3
+   espressif/esp_codec_dev: ~1.6.2
+   espressif/esp-sr: ==2.4.7
++  espressif/esp-tflite-micro: "*"
+   espressif/button: ~4.2.1
+   espressif/knob: ^1.1.0
+   esphome/esp-hub75:

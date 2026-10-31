@@ -1,0 +1,31 @@
+{
+  "model_bytes": 30288,
+  "frontend": {
+    "sample_rate": 16000,
+    "win": 512,
+    "hop": 160,
+    "n_mel": 40,
+    "frames": 64,
+    "mel_range_hz": [
+      60,
+      7800
+    ],
+    "norm": "per-utterance mean/var on log10(power+1e-6)"
+  },
+  "quantization": {
+    "in_scale": 0.049747779965400696,
+    "in_zero_point": 18,
+    "out_scale": 0.00390625,
+    "out_zero_point": -128
+  },
+  "input_tensor": "int8 [1,64,40,1], x_int8 = round(x/scale)+zp, scale=0.0497478 zp=18",
+  "output_tensor": "int8 scalar, p = (y-zp)*scale, scale=0.00390625 zp=-128",
+  "threshold_recommendation": {
+    "score_thresh": 0.7,
+    "consecutive_windows_required": 3,
+    "window_hop_s": 0.5,
+    "effective_reaction": "连续约 2 秒抽纸动作后触发（对应\"连抽几张\"）",
+    "refractory_after_trigger_s": 10,
+    "note": "正式录音替换合成正样本重训后必须重扫阈值"
+  }
+}
