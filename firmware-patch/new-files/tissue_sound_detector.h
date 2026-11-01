@@ -11,18 +11,18 @@
 //   16k 单声道 → 64 帧 × hop160(10ms) × win512 对称 hann → rfft 功率 →
 //   40 mel(60-7800Hz) → log10(P+1e-6) → 整窗 mean/var 归一化 → int8 TFLite。
 //
-// 判决（v3，按真机反馈重调）：
-//   滑动间隔 0.25s，最近 16 窗（4 秒）内：
-//   ① 强规则：任一窗 score ≥ 0.78（一次明确的抽纸）→ 触发
-//   ② 弱规则：≥4 窗 score ≥ 0.55（两次不太明确的抽纸累积）→ 触发
-//   触发后冷却 10 秒。单次不明确的抽纸（1 到 3 窗命中 0.55 档）不触发。
+// 判决（v5，用户反馈“太钝”，全面放宽）：
+//   滑动间隔 0.25s，最近 16 窗（4 秒）：
+//   ① 强规则：任一窗 score ≥ 0.70（一次明确抽纸，比 v4 的 0.78 更灵敏）→ 触发
+//   ② 弱规则：≥3 窗 score ≥ 0.50（两次不太明确的抽纸累积）→ 触发
+//   触发后冷却 24 窗（6 秒）。
 class TissueSoundDetector {
 public:
-    static constexpr float  kStrongScore     = 0.78f;  // ① 一次明确抽纸的门槛
-    static constexpr float  kMediumScore     = 0.55f;  // ② 模糊抽纸的计分门槛
-    static constexpr int    kMediumHits      = 4;      // ② 16 窗内命中次数（对应两下）
+    static constexpr float  kStrongScore     = 0.70f;  // ① 一次明确抽纸的门槛（v5: 0.78→0.70）
+    static constexpr float  kMediumScore     = 0.50f;  // ② 模糊抽纸的计分门槛（v5: 0.55→0.50）
+    static constexpr int    kMediumHits      = 3;      // ② 16 窗内命中次数（v5: 4→3，对应两下）
     static constexpr int    kHistorySize     = 16;     // 16 × 0.25s = 4 秒跨度
-    static constexpr int    kRefractoryWindows = 40;   // 每窗 0.25s → 冷却 10s
+    static constexpr int    kRefractoryWindows = 24;   // 每窗 0.25s → 冷却 6s（v5: 10s→6s）
     static constexpr size_t kWindowSamples   = 16000;  // 1s 分析窗
     static constexpr size_t kSlideSamples    = 4000;   // 0.25s 滑动
 

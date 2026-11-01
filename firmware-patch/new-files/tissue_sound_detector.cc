@@ -254,9 +254,9 @@ void TissueSoundDetector::PushScore(float s) {
 
 bool TissueSoundDetector::MaybeTrigger() {
     if (!enabled_.load() || !ready()) return false;
-    if (hist_len_ < kHistorySize) return false;
+    if (hist_len_ < 6) return false;  // v5: 至少 6 窗（1.5s）即可判定，不等历史填满
     int strong = 0, medium = 0;
-    for (int i = 0; i < kHistorySize; ++i) {
+    for (int i = 0; i < hist_len_; ++i) {
         if (history_[i] >= kStrongScore) ++strong;
         else if (history_[i] >= kMediumScore) ++medium;
     }
