@@ -83,7 +83,8 @@ bool TissueSoundDetector::Initialize() {
     resolver->AddLogistic();
     resolver_ = resolver;
 
-    constexpr size_t kArenaSize = 64 * 1024;
+    // Arena 估算：conv im2col 可能需要 250KB+，直接给 512KB（PSRAM 充裕）
+    constexpr size_t kArenaSize = 512 * 1024;
     tensor_arena_ = static_cast<uint8_t*>(heap_caps_malloc(kArenaSize, MALLOC_CAP_SPIRAM));
     if (tensor_arena_ == nullptr)
         tensor_arena_ = static_cast<uint8_t*>(heap_caps_malloc(kArenaSize, MALLOC_CAP_INTERNAL));
@@ -99,6 +100,7 @@ bool TissueSoundDetector::Initialize() {
         hann_[i] = 0.5f - 0.5f * cosf(2.0f * static_cast<float>(M_PI) * i / (kWin - 1));
     mel_.reserve(kFrames * kMels);
     buf_.reserve(kWindowSamples + 4096);
+    work_.reserve(kWindowSamples);
     fft_re_ = static_cast<float*>(heap_caps_malloc(kWin * sizeof(float), MALLOC_CAP_INTERNAL));
     fft_im_ = static_cast<float*>(heap_caps_malloc(kWin * sizeof(float), MALLOC_CAP_INTERNAL));
     mutex_ = xSemaphoreCreateMutex();
@@ -111,7 +113,7 @@ bool TissueSoundDetector::Initialize() {
         return false;
     }
     ESP_LOGI(TAG, "Tissue detector ready（model %u bytes, thr %.2f, %d/%d 窗）",
-             g_tissue_model_data_len, kScoreThreshold, kHitsRequired, kHistorySize);
+             g_tissue_model_data_len, kStrongScore, kMediumHits, kHistorySize);
     return true;
 }
 
@@ -140,16 +142,21 @@ void TissueSoundDetector::Feed(const int16_t* samples, size_t count) {
 
 void TissueSoundDetector::AnalyzeLoop() {
     while (true) {
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(25));
         if (!enabled_.load()) continue;
         bool has_window = false;
+        // 锁内拷贝快照、锁外分析：Feed 线程并发 push_back 引发 vector 扩容重分配时，
+        // 分析线程绝不触碰 buf_ 的内部指针（v2 崩溃根因：GuruMeditation StoreProhibited）
         if (xSemaphoreTake(static_cast<SemaphoreHandle_t>(mutex_), pdMS_TO_TICKS(100)) == pdTRUE) {
-            has_window = buf_.size() >= kWindowSamples;
+            if (buf_.size() >= kWindowSamples) {
+                work_.assign(buf_.begin(), buf_.begin() + kWindowSamples);
+                has_window = true;
+            }
             xSemaphoreGive(static_cast<SemaphoreHandle_t>(mutex_));
         }
         if (!has_window) continue;
 
-        AnalyzeWindow();  // ~10ms（含 64 次 FFT），在低优先级任务里不挤占音频路径
+        AnalyzeWindow(work_);  // ~10ms，仅触碰 work_/mel_ 私有内存，不碰 buf_
 
         if (xSemaphoreTake(static_cast<SemaphoreHandle_t>(mutex_), pdMS_TO_TICKS(100)) == pdTRUE) {
             buf_.erase(buf_.begin(), buf_.begin() + kSlideSamples);
@@ -158,10 +165,10 @@ void TissueSoundDetector::AnalyzeLoop() {
     }
 }
 
-void TissueSoundDetector::AnalyzeWindow() {
+void TissueSoundDetector::AnalyzeWindow(std::vector<float>& win) {
     mel_.clear();
     for (int k = 0; k < kFrames; ++k) {
-        const float* x = buf_.data() + k * kHop;
+        const float* x = win.data() + k * kHop;
         for (int i = 0; i < kWin; ++i) {
             fft_re_[i] = x[i] * hann_[i];
             fft_im_[i] = 0.0f;
@@ -201,10 +208,22 @@ void TissueSoundDetector::AnalyzeWindow() {
     }
     last_score_ = (output->data.int8[0] - kOutZp) * kOutScale;
     PushScore(last_score_);
+
+    // 诊断日志：每 4 窗（约 1 秒）报一次得分与双规则命中状态
+    static uint32_t diag_cnt = 0;
+    if ((diag_cnt++ & 0x3) == 0) {
+        int strong = 0, medium = 0;
+        for (int i = 0; i < hist_len_; ++i) {
+            if (history_[i] >= kStrongScore) ++strong;
+            else if (history_[i] >= kMediumScore) ++medium;
+        }
+        ESP_LOGI(TAG, "score=%.2f strong=%d medium=%d/%d refr=%d", last_score_, strong,
+                 medium, hist_len_, refractory_);
+    }
 }
 
 void TissueSoundDetector::PushScore(float s) {
-    if (refractory_ > 0) { --refractory_; return; }  // 冷却按窗计数（每窗 0.5s），与轮询频率无关
+    if (refractory_ > 0) { --refractory_; return; }  // 冷却按窗计数（每窗 0.25s）
     history_[hist_head_] = s;
     hist_head_ = (hist_head_ + 1) % kHistorySize;
     if (hist_len_ < kHistorySize) ++hist_len_;
@@ -213,12 +232,16 @@ void TissueSoundDetector::PushScore(float s) {
 bool TissueSoundDetector::MaybeTrigger() {
     if (!enabled_.load() || !ready()) return false;
     if (hist_len_ < kHistorySize) return false;
-    int hits = 0;
-    for (int i = 0; i < kHistorySize; ++i)
-        if (history_[i] >= kScoreThreshold) ++hits;
-    if (hits >= kHitsRequired) {
+    int strong = 0, medium = 0;
+    for (int i = 0; i < kHistorySize; ++i) {
+        if (history_[i] >= kStrongScore) ++strong;
+        else if (history_[i] >= kMediumScore) ++medium;
+    }
+    // ① 强规则：一次明确的抽纸（高分窗出现即触发）
+    // ② 弱规则：两次不太明确的抽纸累积（4 窗中分命中）
+    if (strong >= 1 || medium >= kMediumHits) {
         refractory_ = kRefractoryWindows;
-        ESP_LOGI(TAG, "Tissue pull detected（%d/%d 窗命中）→ WakeWordInvoke", hits, kHistorySize);
+        ESP_LOGI(TAG, "Tissue detected（strong=%d medium=%d）→ WakeWordInvoke", strong, medium);
         return true;
     }
     return false;

@@ -11,17 +11,20 @@
 //   16k 单声道 → 64 帧 × hop160(10ms) × win512 对称 hann → rfft 功率 →
 //   40 mel(60-7800Hz) → log10(P+1e-6) → 整窗 mean/var 归一化 → int8 TFLite。
 //
-// 判决：最近 8 窗（约 4 秒跨度）中 ≥5 窗 score ≥ 0.8 → 触发。
-//   对应"连抽几张（3 秒上下连续抽纸声）才有反应"，单张短促抽纸不触发；
-//   触发后冷却 10 秒。全部参数可在常量区调，无需重训。
+// 判决（v3，按真机反馈重调）：
+//   滑动间隔 0.25s，最近 16 窗（4 秒）内：
+//   ① 强规则：任一窗 score ≥ 0.78（一次明确的抽纸）→ 触发
+//   ② 弱规则：≥4 窗 score ≥ 0.55（两次不太明确的抽纸累积）→ 触发
+//   触发后冷却 10 秒。单次不明确的抽纸（1 到 3 窗命中 0.55 档）不触发。
 class TissueSoundDetector {
 public:
-    static constexpr float  kScoreThreshold   = MODEL_SCORE_THRESH;  // 0.80
-    static constexpr int    kHistorySize      = 8;
-    static constexpr int    kHitsRequired     = 5;
-    static constexpr int    kRefractoryWindows = 20;   // 每窗 0.5s → 冷却 10s
-    static constexpr size_t kWindowSamples    = 16000; // 1s 分析窗
-    static constexpr size_t kSlideSamples     = 8000;  // 0.5s 滑动
+    static constexpr float  kStrongScore     = 0.78f;  // ① 一次明确抽纸的门槛
+    static constexpr float  kMediumScore     = 0.55f;  // ② 模糊抽纸的计分门槛
+    static constexpr int    kMediumHits      = 4;      // ② 16 窗内命中次数（对应两下）
+    static constexpr int    kHistorySize     = 16;     // 16 × 0.25s = 4 秒跨度
+    static constexpr int    kRefractoryWindows = 40;   // 每窗 0.25s → 冷却 10s
+    static constexpr size_t kWindowSamples   = 16000;  // 1s 分析窗
+    static constexpr size_t kSlideSamples    = 4000;   // 0.25s 滑动
 
     bool Initialize();   // 加载模型、建分析任务；成功后 ready()==true
     // 任意任务线程安全；从 AFE 旁路喂 16k 单声道 PCM（任意块大小）
@@ -34,10 +37,11 @@ public:
 
 private:
     void AnalyzeLoop();          // 分析任务主体
-    void AnalyzeWindow();        // 消费 buf_ 前端 16000 样本 → 推理 → PushScore
+    void AnalyzeWindow(std::vector<float>& win);  // 分析一个 16000 样本窗口快照
     void PushScore(float s);
 
     std::vector<float> buf_;            // 原始 PCM 池（mutex_ 保护）
+    std::vector<float> work_;           // 窗口快照（仅分析任务使用，锁外分析用）
     std::vector<float> mel_;            // 64*40 展平
     float hann_[512];
     float history_[kHistorySize] = {0};
