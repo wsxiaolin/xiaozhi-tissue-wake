@@ -32,6 +32,7 @@ public:
     // 周期调用（1s 一次即可）；满足判决条件返回 true（内部自带冷却）
     bool MaybeTrigger();
     void Enable(bool on);   // 只在待机态监听：非 idle 由 Application 关闭，避免自己 TTS 触发自己
+    bool IsActive() const { return enabled_.load(); }
     float last_score() const { return last_score_; }
     bool ready() const { return interpreter_ != nullptr; }
 
@@ -52,6 +53,8 @@ private:
     void* task_handle_ = nullptr;
     void* mutex_ = nullptr;             // SemaphoreHandle_t
     std::atomic<bool> enabled_{false};
+    std::atomic<bool> in_analysis_{false};  // Enable(false) 等待分析轮次结束的代际标志
+    int zero_window_count_ = 0;             // 聱启动自检：连续全零窗计数
     float* fft_re_ = nullptr;           // 工作区（内部 RAM 一次性分配）
     float* fft_im_ = nullptr;
 

@@ -105,13 +105,49 @@ index e1f0719..f635036 100644
      switch (new_state) {
          case kDeviceStateUnknown:
          case kDeviceStateIdle:
+diff --git a/main/audio/audio_service.cc b/main/audio/audio_service.cc
+index 358a094..3dd1f89 100644
+--- a/main/audio/audio_service.cc
++++ b/main/audio/audio_service.cc
+@@ -1,6 +1,9 @@
+ #include "audio_service.h"
+ #include <esp_log.h>
+ #include <cstring>
++#if CONFIG_SOUND_EVENT_TISSUE
++#include "sound_events/tissue_sound_detector.h"
++#endif
+ 
+ #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)                                        \
+     (esp_ae_rate_cvt_cfg_t) {                                                                \
+@@ -840,6 +843,18 @@ void AudioService::CheckAndUpdateAudioPowerState() {
+         std::chrono::duration_cast<std::chrono::milliseconds>(now - last_input_time_).count();
+     auto output_elapsed =
+         std::chrono::duration_cast<std::chrono::milliseconds>(now - last_output_time_).count();
++#if CONFIG_SOUND_EVENT_TISSUE
++    // 抽纸检测在待机态持续吃音频流：待机期间不关输入（含 ADC），
++    // 同时规避 EnableInput 翻转引发的 INMP441 时序问题（聱启动 Bug2 根源）
++    if (GetTissueSoundDetector().ready() && GetTissueSoundDetector().IsActive()) {
++        if (output_elapsed > AUDIO_POWER_TIMEOUT_MS * 4 && codec_->output_enabled()) {
++            if (!(codec_->duplex() && codec_->input_enabled())) {
++                codec_->EnableOutput(false);
++            }
++        }
++        return;
++    }
++#endif
+     if (input_elapsed > AUDIO_POWER_TIMEOUT_MS && codec_->input_enabled()) {
+         // ADC continuous start/stop must run in the same task. Wake the audio
+         // input task instead of closing the codec from the esp_timer task.
 diff --git a/main/audio/engines/afe_audio_engine.cc b/main/audio/engines/afe_audio_engine.cc
-index e245876..6d0b186 100644
+index e245876..612f24d 100644
 --- a/main/audio/engines/afe_audio_engine.cc
 +++ b/main/audio/engines/afe_audio_engine.cc
-@@ -12,6 +12,9 @@
+@@ -11,7 +11,12 @@
+ #include <esp_vadn_models.h>
  
  #include "audio_service.h"
++#include <algorithm>
++
  #include "wake_words/custom_wake_word.h"
 +#if CONFIG_SOUND_EVENT_TISSUE
 +#include "sound_events/tissue_sound_detector.h"
@@ -119,7 +155,103 @@ index e245876..6d0b186 100644
  
  #define TAG "AfeAudioEngine"
  
-@@ -445,6 +448,12 @@ void AfeAudioEngine::ProcessingTask() {
+@@ -81,7 +86,9 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
+     }
+ 
+     if (multinet_model_name != nullptr) {
+-        wake_detector_ = WakeDetector::kMultiNet;
++        // v4：WakeNet 与 MultiNet 并行（原本二选一）。双通道唤醒：
++        //   WakeNet 在 AFE 内检测官方词，MultiNet 独立检测自定义词（吃同一份 AFE 输出）
++        wake_detector_ = (wakenet_model_name != nullptr) ? WakeDetector::kBoth : WakeDetector::kMultiNet;
+         custom_wake_word_ = std::make_unique<CustomWakeWord>();
+         custom_wake_word_->OnWakeWordDetected([this](const std::string& wake_word) {
+             last_detected_wake_word_ = wake_word;
+@@ -97,7 +104,8 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
+             wake_detector_ = WakeDetector::kNone;
+             return false;
+         }
+-    } else if (wakenet_model_name != nullptr) {
++    } 
++    if (wakenet_model_name != nullptr && wake_detector_ != WakeDetector::kBoth) {
+         wake_detector_ = WakeDetector::kWakeNet;
+ #if CONFIG_SEND_WAKE_WORD_DATA
+         if (!wake_word_audio_cache_.Initialize(16000 * 2)) {
+@@ -140,10 +148,10 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
+     if (vad_model_name != nullptr) {
+         afe_config->vad_model_name = vad_model_name;
+     }
+-    afe_config->wakenet_init = wake_detector_ == WakeDetector::kWakeNet;
++    afe_config->wakenet_init = wake_detector_ == WakeDetector::kWakeNet || wake_detector_ == WakeDetector::kBoth;
+     afe_config->wakenet_model_name = nullptr;
+     afe_config->wakenet_model_name_2 = nullptr;
+-    if (wake_detector_ == WakeDetector::kWakeNet && models_ != nullptr) {
++    if ((wake_detector_ == WakeDetector::kWakeNet || wake_detector_ == WakeDetector::kBoth) && models_ != nullptr) {
+         std::vector<char*> wakenet_models;
+         for (int i = 0; i < models_->num; ++i) {
+             char* name = models_->model_name[i];
+@@ -201,7 +209,7 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
+         return false;
+     }
+ 
+-    if (wake_detector_ == WakeDetector::kWakeNet) {
++    if (wake_detector_ == WakeDetector::kWakeNet || wake_detector_ == WakeDetector::kBoth) {
+         afe_iface_->disable_wakenet(afe_data_);
+     }
+     if (codec_->input_reference()) {
+@@ -243,9 +251,9 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
+         return false;
+     }
+ 
+-    const char* detector = wake_detector_ == WakeDetector::kWakeNet
+-                               ? "WakeNet"
+-                               : (wake_detector_ == WakeDetector::kMultiNet ? "MultiNet" : "none");
++    const char* detector = wake_detector_ == WakeDetector::kBoth ? "WakeNet+MultiNet"
++                               : (wake_detector_ == WakeDetector::kWakeNet ? "WakeNet"
++                               : (wake_detector_ == WakeDetector::kMultiNet ? "MultiNet" : "none"));
+     ESP_LOGI(TAG, "Initialized FD AFE, detector: %s, NS: off, feed: %d, fetch: %d", detector,
+              afe_iface_->get_feed_chunksize(afe_data_), afe_iface_->get_fetch_chunksize(afe_data_));
+     ESP_LOGI(TAG, "After AFE create: free=%u min=%u largest=%u",
+@@ -284,13 +292,13 @@ void AfeAudioEngine::EnableWakeWordDetection(bool enable) {
+     // WakeNet enable/disable on the AFE instance is applied by ProcessingTask
+     // (see ApplyAfeControls), driven by the kWakeWordEnabled bit.
+     if (enable) {
+-        if (wake_detector_ == WakeDetector::kMultiNet) {
++        if (wake_detector_ == WakeDetector::kMultiNet || wake_detector_ == WakeDetector::kBoth) {
+             custom_wake_word_->Start();
+         }
+         xEventGroupSetBits(event_group_, kWakeWordEnabled);
+     } else {
+         xEventGroupClearBits(event_group_, kWakeWordEnabled);
+-        if (wake_detector_ == WakeDetector::kMultiNet) {
++        if (wake_detector_ == WakeDetector::kMultiNet || wake_detector_ == WakeDetector::kBoth) {
+             custom_wake_word_->Stop();
+         }
+     }
+@@ -318,7 +326,13 @@ void AfeAudioEngine::EnableDeviceAec(bool enable) {
+ bool AfeAudioEngine::HasWakeWord() const { return wake_detector_ != WakeDetector::kNone; }
+ 
+ std::vector<std::string> AfeAudioEngine::GetWakeWords() const {
+-    return custom_wake_word_ ? custom_wake_word_->GetWakeWords() : wake_words_;
++    auto words = wake_words_;  // kBoth/kWakeNet：官方词
++    if (custom_wake_word_) {
++        for (auto& w : custom_wake_word_->GetWakeWords()) {
++            if (std::find(words.begin(), words.end(), w) == words.end()) words.push_back(w);
++        }
++    }
++    return words;
+ }
+ 
+ bool AfeAudioEngine::IsWakeWordDetectionEnabled() const {
+@@ -384,7 +398,7 @@ void AfeAudioEngine::UpdateAecState() {
+ 
+ void AfeAudioEngine::ApplyAfeControls() {
+     EventBits_t bits = xEventGroupGetBits(event_group_);
+-    if (wake_detector_ == WakeDetector::kWakeNet) {
++    if (wake_detector_ == WakeDetector::kWakeNet || wake_detector_ == WakeDetector::kBoth) {
+         if (bits & kWakeWordEnabled) {
+             afe_iface_->enable_wakenet(afe_data_);
+         } else {
+@@ -445,6 +459,12 @@ void AfeAudioEngine::ProcessingTask() {
          if (bits & kWakeWordEnabled) {
              HandleWakeWordResult(result);
          }
@@ -132,6 +264,52 @@ index e245876..6d0b186 100644
          if (kUseAfeForVoiceProcessing && (bits & kVoiceProcessingEnabled)) {
              HandleVoiceResult(result);
          }
+@@ -457,6 +477,11 @@ void AfeAudioEngine::HandleWakeWordResult(const afe_fetch_result_t* result) {
+         return;
+     }
+ 
++    // kBoth：官方词（WakeNet 在 AFE 内）与自定义词（MultiNet 旁路）并行检测
++    if (wake_detector_ == WakeDetector::kBoth) {
++        custom_wake_word_->FeedMono(result->data, result->data_size / sizeof(int16_t));
++    }
++
+ #if CONFIG_SEND_WAKE_WORD_DATA
+     wake_word_audio_cache_.Store(result->data, result->data_size / sizeof(int16_t));
+ #endif
+@@ -535,7 +560,7 @@ void AfeAudioEngine::OutputRawAudio(const std::vector<int16_t>& data) {
+ }
+ 
+ void AfeAudioEngine::EncodeWakeWordData() {
+-    if (wake_detector_ == WakeDetector::kMultiNet) {
++    if (wake_detector_ == WakeDetector::kMultiNet || wake_detector_ == WakeDetector::kBoth) {
+         custom_wake_word_->EncodeWakeWordData();
+         return;
+     }
+@@ -626,10 +651,10 @@ void AfeAudioEngine::EncodeWakeWordData() {
+ }
+ 
+ bool AfeAudioEngine::GetWakeWordOpus(std::vector<uint8_t>& opus) {
+-    if (wake_detector_ == WakeDetector::kMultiNet) {
++    if (wake_detector_ == WakeDetector::kMultiNet || wake_detector_ == WakeDetector::kBoth) {
+         return custom_wake_word_->GetWakeWordOpus(opus);
+     }
+-    if (wake_detector_ != WakeDetector::kWakeNet) {
++    if (wake_detector_ != WakeDetector::kWakeNet && wake_detector_ != WakeDetector::kBoth) {
+         return false;
+     }
+     std::unique_lock<std::mutex> lock(wake_word_mutex_);
+diff --git a/main/audio/engines/afe_audio_engine.h b/main/audio/engines/afe_audio_engine.h
+index ad262b6..768159a 100644
+--- a/main/audio/engines/afe_audio_engine.h
++++ b/main/audio/engines/afe_audio_engine.h
+@@ -52,6 +52,7 @@ private:
+         kNone,
+         kWakeNet,
+         kMultiNet,
++        kBoth,
+     };
+ 
+     static constexpr EventBits_t kWakeWordEnabled = 1 << 0;
 diff --git a/main/idf_component.yml b/main/idf_component.yml
 index c9c64ec..9b2c2e3 100644
 --- a/main/idf_component.yml
@@ -144,3 +322,50 @@ index c9c64ec..9b2c2e3 100644
    espressif/button: ~4.2.1
    espressif/knob: ^1.1.0
    esphome/esp-hub75:
+diff --git a/scripts/build_default_assets.py b/scripts/build_default_assets.py
+index 0bd5027..c3cfec0 100755
+--- a/scripts/build_default_assets.py
++++ b/scripts/build_default_assets.py
+@@ -1062,20 +1062,34 @@ def main():
+         # Determine language from multinet models
+         language = get_language_from_multinet_models(multinet_model_names)
+         
++        # v4: 支持多条命令词 —— CONFIG_CUSTOM_WAKE_WORD 用竖线分隔：
++        #   CONFIG_CUSTOM_WAKE_WORD="ni hao xiao chou|ni hao sheng chou|ni hao lao chou|ni hao xiao zhi"
++        #   CONFIG_CUSTOM_WAKE_WORD_DISPLAY="你好小抽|你好生抽|你好老抽|你好小纸"
++        raw_cmds = [c.strip() for c in custom_wake_word_config['wake_word'].split('|') if c.strip()]
++        raw_displays = [c.strip() for c in custom_wake_word_config['display'].split('|') if c.strip()]
++        if len(raw_displays) == 1 and len(raw_cmds) > 1:
++            raw_displays = raw_displays * len(raw_cmds)  # 显示名未逐一给出时复用单值
++        commands_list = []
++        for idx, cmd in enumerate(raw_cmds):
++            commands_list.append({
++                "command": cmd,
++                "text": raw_displays[idx] if idx < len(raw_displays) else cmd,
++                "action": "wake"
++            })
++        if not commands_list:
++            commands_list = [{
++                "command": custom_wake_word_config['wake_word'],
++                "text": custom_wake_word_config['display'],
++                "action": "wake"
++            }]
+         # Build multinet_model info structure
+         multinet_model_info = {
+             "language": language,
+             "duration": 3000,  # Default duration in ms
+             "threshold": custom_wake_word_config['threshold'],
+-            "commands": [
+-                {
+-                    "command": custom_wake_word_config['wake_word'],
+-                    "text": custom_wake_word_config['display'],
+-                    "action": "wake"
+-                }
+-            ]
++            "commands": commands_list
+         }
+-        print(f"  custom wake word: {custom_wake_word_config['wake_word']} ({custom_wake_word_config['display']})")
++        print(f"  custom wake words: {[c['text'] for c in commands_list]}")
+         print(f"  wake word language: {language}")
+         print(f"  wake word threshold: {custom_wake_word_config['threshold']}")
+ 

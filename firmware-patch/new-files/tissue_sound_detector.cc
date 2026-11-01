@@ -100,7 +100,7 @@ bool TissueSoundDetector::Initialize() {
         hann_[i] = 0.5f - 0.5f * cosf(2.0f * static_cast<float>(M_PI) * i / (kWin - 1));
     mel_.reserve(kFrames * kMels);
     buf_.reserve(kWindowSamples + 4096);
-    work_.reserve(kWindowSamples);
+    work_.resize(kWindowSamples);
     fft_re_ = static_cast<float*>(heap_caps_malloc(kWin * sizeof(float), MALLOC_CAP_INTERNAL));
     fft_im_ = static_cast<float*>(heap_caps_malloc(kWin * sizeof(float), MALLOC_CAP_INTERNAL));
     mutex_ = xSemaphoreCreateMutex();
@@ -145,18 +145,24 @@ void TissueSoundDetector::AnalyzeLoop() {
         vTaskDelay(pdMS_TO_TICKS(25));
         if (!enabled_.load()) continue;
         bool has_window = false;
-        // 锁内拷贝快照、锁外分析：Feed 线程并发 push_back 引发 vector 扩容重分配时，
-        // 分析线程绝不触碰 buf_ 的内部指针（v2 崩溃根因：GuruMeditation StoreProhibited）
+        // 锁内拷贝快照到预分配缓冲（无堆分配）；in_analysis_ 代际标志让
+        // Enable(false) 等待本轮结束再清状态，避免清空时分析线程仍在半途访问共享结构
+        in_analysis_.store(true);
         if (xSemaphoreTake(static_cast<SemaphoreHandle_t>(mutex_), pdMS_TO_TICKS(100)) == pdTRUE) {
             if (buf_.size() >= kWindowSamples) {
-                work_.assign(buf_.begin(), buf_.begin() + kWindowSamples);
+                if (work_.size() < kWindowSamples) work_.resize(kWindowSamples);
+                std::copy(buf_.begin(), buf_.begin() + kWindowSamples, work_.begin());
                 has_window = true;
             }
             xSemaphoreGive(static_cast<SemaphoreHandle_t>(mutex_));
         }
-        if (!has_window) continue;
+        if (!has_window) {
+            in_analysis_.store(false);
+            continue;
+        }
 
         AnalyzeWindow(work_);  // ~10ms，仅触碰 work_/mel_ 私有内存，不碰 buf_
+        in_analysis_.store(false);
 
         if (xSemaphoreTake(static_cast<SemaphoreHandle_t>(mutex_), pdMS_TO_TICKS(100)) == pdTRUE) {
             buf_.erase(buf_.begin(), buf_.begin() + kSlideSamples);
@@ -167,6 +173,21 @@ void TissueSoundDetector::AnalyzeLoop() {
 
 void TissueSoundDetector::AnalyzeWindow(std::vector<float>& win) {
     mel_.clear();
+    bool all_zero = true;
+    for (float v : win) {
+        if (v > 1e-4f || v < -1e-4f) { all_zero = false; break; }
+    }
+    if (all_zero) {
+        // 聱启动自检（Bug2）：输入使能但 ADC 全零。不计入判决历史，累计报警；
+        // 连续 8 窗（约 2 秒）全零则通知应用层（当前策略：日志提示用户复位）
+        zero_window_count_++;
+        last_score_ = 0.0f;
+        if (zero_window_count_ == 8) {
+            ESP_LOGW(TAG, "Audio input all-zero for ~2s（聱启动？）— codec may need reinit/reboot");
+        }
+        return;
+    }
+    zero_window_count_ = 0;
     for (int k = 0; k < kFrames; ++k) {
         const float* x = win.data() + k * kHop;
         for (int i = 0; i < kWin; ++i) {
@@ -207,7 +228,9 @@ void TissueSoundDetector::AnalyzeWindow(std::vector<float>& win) {
         return;
     }
     last_score_ = (output->data.int8[0] - kOutZp) * kOutScale;
-    PushScore(last_score_);
+    if (!all_zero) {
+        PushScore(last_score_);
+    }
 
     // 诊断日志：每 4 窗（约 1 秒）报一次得分与双规则命中状态
     static uint32_t diag_cnt = 0;
